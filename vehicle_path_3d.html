@@ -62,10 +62,10 @@ body.panels-hidden .side-card{visibility:hidden}
 .dock{display:flex;align-items:center;justify-content:space-between;gap:10px 16px;padding:10px 18px;flex-wrap:wrap}
 .main-controls,.telemetry{display:flex;align-items:center;gap:10px}
 .telemetry{gap:20px;flex-wrap:wrap}
-.drive-btn,.top-start-btn{background:linear-gradient(135deg,#00f0ff,#0077ff);color:#040914;border:none;border-radius:10px;font-family:'Orbitron',sans-serif;font-weight:800;letter-spacing:1px;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 0 16px rgba(0,240,255,.5);transition:all .2s}
-.drive-btn{padding:11px 24px;font-size:14px}.top-start-btn{padding:8px 16px;font-size:12px}
-.drive-btn:hover,.top-start-btn:hover{transform:translateY(-2px);box-shadow:0 0 26px rgba(0,240,255,.8)}
-.drive-btn.stopped,.top-start-btn.stopped{background:linear-gradient(135deg,#ff3366,#ff7700);color:#fff;box-shadow:0 0 16px rgba(255,51,102,.5)}
+.drive-btn{background:linear-gradient(135deg,#00f0ff,#0077ff);color:#040914;border:none;border-radius:10px;font-family:'Orbitron',sans-serif;font-weight:800;letter-spacing:1px;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 0 16px rgba(0,240,255,.5);transition:all .2s}
+.drive-btn{padding:11px 24px;font-size:14px}
+.drive-btn:hover{transform:translateY(-2px);box-shadow:0 0 26px rgba(0,240,255,.8)}
+.drive-btn.stopped{background:linear-gradient(135deg,#ff3366,#ff7700);color:#fff;box-shadow:0 0 16px rgba(255,51,102,.5)}
 .t-item{display:flex;flex-direction:column;gap:2px;min-width:68px}
 .t-label{font-size:10px;font-weight:600;color:var(--muted);letter-spacing:.8px}
 .t-val{font-family:'Orbitron',monospace;font-size:17px;font-weight:800;display:flex;align-items:baseline;gap:4px}
@@ -102,7 +102,6 @@ body.panels-hidden .side-card{visibility:hidden}
       <div><div class="brand-title">AUTONAV // 3D</div><div class="brand-sub">Autonomous Path Planner &amp; Cockpit Simulator</div></div>
     </div>
     <div class="status-pill"><div class="status-dot" id="status-dot"></div><span id="status-text">AUTOPILOT READY</span></div>
-    <button class="top-start-btn" id="btn-top-drive" onclick="startDriving()">▶ Start driving</button>
     <div class="seg">
       <button class="seg-btn active" id="mode-auto" onclick="setDriveMode('auto')">🤖 Autopilot</button>
       <button class="seg-btn" id="mode-manual" onclick="setDriveMode('manual')">🎮 Manual</button>
@@ -607,11 +606,9 @@ function triggerWarningStrobe() {
   w.style.opacity = '1'; setTimeout(() => (w.style.opacity = '0'), 250);
 }
 function setDriveButtons(running) {
-  ['btn-drive', 'btn-top-drive'].forEach(id => {
-    const b = document.getElementById(id);
-    b.innerText = running ? '⏸ Pause driving' : '▶ Start driving';
-    b.classList.toggle('stopped', running);
-  });
+  const b = document.getElementById('btn-drive');
+  b.innerText = running ? '⏸ Pause driving' : '▶ Start driving';
+  b.classList.toggle('stopped', running);
 }
 
 /* --- 3D path ribbons (rebuilt only on edits; recoloured live) --- */
