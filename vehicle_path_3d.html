@@ -879,16 +879,19 @@ function simStep(dt) {
 }
 
 let lastTime = performance.now();
+// UI refreshes count frames, not sim ticks: below ~40 fps a frame runs several ticks, and "tick % 3"
+// could then skip every frame, freezing the readouts while the car kept driving
+let frame = 0;
 function stepWorld() {
   const now = performance.now(), dt = Math.min((now - lastTime) / 1000, .05);
-  lastTime = now;
+  lastTime = now; frame++;
   if (sim.running) {
     const sdt = dt * simSpeedMultiplier, n = Math.max(1, Math.ceil(sdt / .02));
     for (let s = 0; s < n && sim.running; s++) simStep(sdt / n);
     if (sim.running) {
-      if (sim.tick % 30 === 0) updatePathCards();            // badges stay truthful while driving
-      if (driveMode === 'auto' && sim.tick % 12 === 0) renderActiveTrajectory();
-      if (sim.tick % 8 === 0) updateTrail();
+      if (frame % 30 === 0) updatePathCards();               // badges stay truthful while driving
+      if (driveMode === 'auto' && frame % 12 === 0) renderActiveTrajectory();
+      if (frame % 8 === 0) updateTrail();
       setEngine(sim.velocity);
     } else updateTrail();
   }
@@ -908,7 +911,7 @@ function stepWorld() {
       legs.forEach((l, k) => (l.rotation.z = k % 2 ? -sw : sw));
     }
   });
-  if (sim.tick % 3 === 0 || !sim.running) updateTelemetry();
+  if (frame % 3 === 0 || !sim.running) updateTelemetry();
 }
 function updateTelemetry() {
   document.getElementById('tel-speed').innerText = sim.velocity.toFixed(1);
@@ -954,6 +957,7 @@ function resetSimulation() {
 function setDriveMode(mode) {
   if (sim.running) pauseDriving();
   driveMode = mode;
+  sim.steerAngle = 0;                            // the new mode starts with the wheels straight, not where the old one left them
   document.getElementById('mode-auto').classList.toggle('active', mode === 'auto');
   document.getElementById('mode-manual').classList.toggle('active', mode === 'manual');
   document.getElementById('manual-dock').classList.toggle('hidden', mode !== 'manual');
