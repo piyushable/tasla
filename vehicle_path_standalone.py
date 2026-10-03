@@ -229,8 +229,9 @@ def path_dev(chosen):
     return dev.reshape(GX.shape)
 
 
-def plan_route(goal, obs, start, v, dev, steep=False):
-    """Time-aware A*. Lane changes are gentle (one cell sideways per two forward) unless steep is set."""
+def plan_route(goal, obs, start, v, dev, steep=False, heading=0.0):
+    """Time-aware A*. Lane changes are gentle (one cell sideways per two forward) unless steep is set.
+    heading is the car's direction of travel; a replanned route leaves along it."""
     sx, sy = start
     t = np.maximum(XS - sx, 0) / max(v, 0.3) * 1.1
     blocked = np.abs(GY) + HALF_W + 0.3 > ROAD_HALF
@@ -292,13 +293,27 @@ def plan_route(goal, obs, start, v, dev, steep=False):
         while b < len(YS) - 1 and not blocked[i, b + 1]:
             b += 1
         lo[k], hi[k] = YS[a], YS[b]
-    lo[:2], hi[:2] = raw[:2, 1], raw[:2, 1]      # keep the start (car position) and goal pinned
-    lo[-2:], hi[-2:] = raw[-2:, 1], raw[-2:, 1]
+    lo[-2:], hi[-2:] = raw[-2:, 1], raw[-2:, 1]  # keep the goal pinned
     # An obstacle's edge is a sudden step in these limits, which would put a corner in the smoothed route.
     # Taper each step into a ramp no steeper than the route itself may be; the raw route still fits inside.
     slope = 1.0 if steep else 0.5
     dist = np.abs(raw[:, 0][:, None] - raw[:, 0][None, :]) * slope
-    lo, hi = np.max(lo[None, :] - dist, axis=1), np.min(hi[None, :] + dist, axis=1)
+
+    def tapered(start_y, lead):
+        a, b = lo.copy(), hi.copy()
+        a[lead], b[lead] = start_y[lead], start_y[lead]
+        return np.max(a[None, :] - dist, axis=1), np.min(b[None, :] + dist, axis=1)
+
+    # On a replan the first half metre carries on the way the car is already going, so the new route
+    # doesn't kink where it joins the old one. Longer than that and it overshoots when the car was
+    # mid lane change. If the route has to leave the other way it can't fit, and only the start is pinned.
+    ahead = raw[:, 0] - start[0]
+    pinned = np.arange(len(raw)) < 2
+    if start[0] > 0.5:
+        lo2, hi2 = tapered(start[1] + np.clip(np.tan(heading), -slope, slope) * ahead, ahead <= 0.5)
+    if start[0] <= 0.5 or np.any(lo2 > hi2 + 1e-9):
+        lo2, hi2 = tapered(raw[:, 1], pinned)
+    lo, hi = lo2, hi2
     y = raw[:, 1].copy()
     if len(y) > 9:
         for _ in range(12):
@@ -340,9 +355,12 @@ def new_sim(choice, paths, obs, v):
 
 def replan(sim, obs, v, count=True):
     # gentle lane changes first; the old 45 degree steps only when nothing gentle fits
-    route = plan_route(sim["goal"], obs, sim["pos"], v, sim["dev"])
+    # the direction the car is actually moving (its body heading lags behind on purpose)
+    (ax, ay), (bx, by) = sim["trail"][-2:] if len(sim["trail"]) > 1 else ((0.0, 0.0), (1.0, 0.0))
+    travel = float(np.arctan2(by - ay, bx - ax))
+    route = plan_route(sim["goal"], obs, sim["pos"], v, sim["dev"], heading=travel)
     if route is None:
-        route = plan_route(sim["goal"], obs, sim["pos"], v, sim["dev"], steep=True)
+        route = plan_route(sim["goal"], obs, sim["pos"], v, sim["dev"], steep=True, heading=travel)
     if route is None:
         sim["status"] = "waiting"
         return False
