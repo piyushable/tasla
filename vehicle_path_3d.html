@@ -825,8 +825,11 @@ function stepManual(dt) {
   const k = keys;
   const up = k['w'] || k['arrowup'], down = k['s'] || k['arrowdown'], left = k['a'] || k['arrowleft'], right = k['d'] || k['arrowright'];
   let v = sim.velocity;
-  v += (up ? 4.5 : down ? -9 : -1.5) * dt;
-  v = clamp(v, 0, 9);
+  // S brakes, and once stopped keeps going into reverse; that's the only way out after nosing into something
+  if (up) v += 4.5 * dt;
+  else if (down) v += (v > .05 ? -9 : -2.5) * dt;
+  else v = v > 0 ? Math.max(v - 1.5 * dt, 0) : Math.min(v + 1.5 * dt, 0);
+  v = clamp(v, -3, 9);
   const steerIn = ((right ? 1 : 0) - (left ? 1 : 0)) * .5;       // +z is the car's right
   sim.steerAngle += (steerIn - sim.steerAngle) * Math.min(1, dt * 6);
   sim.heading = clamp(sim.heading + (v / 2.6) * Math.tan(sim.steerAngle) * dt, -.9, .9);
@@ -835,10 +838,18 @@ function stepManual(dt) {
   const lim = ROAD_HALF - .9;
   if (Math.abs(ny) > lim) { ny = clamp(ny, -lim, lim); v *= .97; }
   const hit = willCollide(nx, ny, obstacles, 0);
-  if (hit) { v = 0; nx = sim.pos[0]; ny = sim.pos[1]; }            // crash stops the car (audit below flags it)
+  if (hit) {
+    // the car stops just short of overlapping, so the overlap check in simStep never saw these; count it here, once per bump
+    if (!sim.bumping && Math.abs(v) > .3) {
+      sim.collided = true;
+      triggerWarningStrobe(); playChime(150, 'sawtooth', .2, .3);
+      toast(`💥 Hit the ${hit.type.split(' ')[1]}. Hold S to back up.`);
+    }
+    sim.bumping = hit; v = 0; nx = sim.pos[0]; ny = sim.pos[1];
+  } else sim.bumping = null;
   sim.pos = [nx, ny]; sim.velocity = v;
   if (sim.tick % 4 === 0) sim.trail.push([nx, ny]);
-  updateStatusDisplay(`MANUAL // ${v.toFixed(1)} m/s  [W/S] throttle  [A/D] steer`, '#00ff9d');
+  updateStatusDisplay(sim.bumping ? `💥 Stuck on the ${sim.bumping.type.split(' ')[1]} // hold S to back up` : `MANUAL // ${v.toFixed(1)} m/s  [S] brake/reverse`, sim.bumping ? '#ffaa00' : '#00ff9d');
 }
 
 function finishRun() {
@@ -889,7 +900,7 @@ function stepWorld() {
       if (frame % 30 === 0) updatePathCards();               // badges stay truthful while driving
       if (driveMode === 'auto' && frame % 12 === 0) renderActiveTrajectory();
       if (frame % 8 === 0) updateTrail();
-      setEngine(sim.velocity);
+      setEngine(Math.abs(sim.velocity));                     // reversing still runs the engine
     } else updateTrail();
   }
   // visuals
@@ -932,7 +943,7 @@ function startDriving() {
     replan(false);
     sim.velocity = sim.status === 'waiting' ? 0 : curSpeed();
     toast(`▶ Driving ${chosenPathName} (goal in ~10 s at 1x)`);
-  } else toast('🎮 Manual: W/S throttle & brake, A/D steer');
+  } else toast('🎮 Manual: W throttle, S brake/reverse, A/D steer');
   setDriveButtons(true);
   lastTime = performance.now();
 }
