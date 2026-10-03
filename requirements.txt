@@ -1,5 +1,6 @@
 numpy
 matplotlib
 pandas
-streamlit
+# st.fragment(run_every=...) and st.rerun(scope="fragment") need 1.37+
+streamlit>=1.37
 plotly
