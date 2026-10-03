@@ -138,6 +138,7 @@ HX0, HY0 = VEH_LEN / 2, HALF_W
 HX, HY = HX0 + 0.5, HY0 + 0.6
 VX, VY = HX0 + 0.3, HY0 + 0.4
 V_NOM = 2.5
+MAX_YAW = 1.5  # rad/s
 OBJ = {
     "🧍 Pedestrian": (0.8, 0.8, 1.2),
     "🐄 Cow": (2.0, 0.9, 0.7),
@@ -228,7 +229,9 @@ def path_dev(chosen):
     return dev.reshape(GX.shape)
 
 
-def plan_route(goal, obs, start, v, dev):
+def plan_route(goal, obs, start, v, dev, steep=False, heading=0.0):
+    """Time-aware A*. Lane changes are gentle (one cell sideways per two forward) unless steep is set.
+    heading is the car's direction of travel; a replanned route leaves along it."""
     sx, sy = start
     t = np.maximum(XS - sx, 0) / max(v, 0.3) * 1.1
     blocked = np.abs(GY) + HALF_W + 0.3 > ROAD_HALF
@@ -252,14 +255,17 @@ def plan_route(goal, obs, start, v, dev):
         _, gc, i, j = heapq.heappop(heap)
         if gc > g.get((i, j), np.inf):
             continue
-        if i == gi and abs(j - gj) <= 1:
+        if i >= gi and abs(j - gj) <= 1:
             done = True
             break
         for dj in (-1, 0, 1):
-            ni, nj = i + 1, j + dj
+            di = 2 if dj and not steep else 1
+            ni, nj = i + di, j + dj
             if ni >= len(XS) or not (0 <= nj < len(YS)) or blocked[ni, nj]:
                 continue
-            ng = gc + np.hypot(1, dj) * RES * (1 + 0.8 * dev[ni, nj]) + 0.02 * abs(dj)
+            if di == 2 and (blocked[i + 1, j] or blocked[i + 1, nj]):
+                continue
+            ng = gc + np.hypot(di, dj) * RES * (1 + 0.8 * dev[ni, nj]) + 0.02 * abs(dj)
             if ng < g.get((ni, nj), np.inf):
                 g[(ni, nj)], parent[(ni, nj)] = ng, (i, j)
                 heapq.heappush(heap, (ng + RES * (gi - ni), ng, ni, nj))
@@ -271,15 +277,48 @@ def plan_route(goal, obs, start, v, dev):
         if node == (si, sj):
             break
         node = parent[node]
-    raw = np.array(out[::-1])
+    raw = densify(np.array(out[::-1]))
     raw[0] = start
-    k = 9
-    pad = np.vstack([np.repeat(raw[:1], k // 2, 0), raw, np.repeat(raw[-1:], k // 2, 0)])
-    smooth = np.column_stack([np.convolve(pad[:, c], np.ones(k) / k, mode="valid") for c in (0, 1)])
-    smooth[0], smooth[-1] = raw[0], raw[-1]
-    ci = np.clip(np.round(smooth[:, 0] / RES).astype(int), 0, len(XS) - 1)
-    cj = np.clip(np.round((smooth[:, 1] + ROAD_HALF) / RES).astype(int), 0, len(YS) - 1)
-    return densify(smooth if not blocked[ci[5:], cj[5:]].any() else raw)
+    # Round the grid's kinks with repeated moving averages, clamping each point into the free stretch of
+    # its grid column so smoothing can slide along an obstacle's edge but never cut into it.
+    ci = np.clip(np.round(raw[:, 0] / RES).astype(int), 0, len(XS) - 1)
+    cj = np.clip(np.round((raw[:, 1] + ROAD_HALF) / RES).astype(int), 0, len(YS) - 1)
+    lo, hi = raw[:, 1].copy(), raw[:, 1].copy()
+    for k, (i, j) in enumerate(zip(ci, cj)):
+        if blocked[i, j]:
+            continue
+        a = b = j
+        while a > 0 and not blocked[i, a - 1]:
+            a -= 1
+        while b < len(YS) - 1 and not blocked[i, b + 1]:
+            b += 1
+        lo[k], hi[k] = YS[a], YS[b]
+    lo[-2:], hi[-2:] = raw[-2:, 1], raw[-2:, 1]  # keep the goal pinned
+    # An obstacle's edge is a sudden step in these limits, which would put a corner in the smoothed route.
+    # Taper each step into a ramp no steeper than the route itself may be; the raw route still fits inside.
+    slope = 1.0 if steep else 0.5
+    dist = np.abs(raw[:, 0][:, None] - raw[:, 0][None, :]) * slope
+
+    def tapered(start_y, lead):
+        a, b = lo.copy(), hi.copy()
+        a[lead], b[lead] = start_y[lead], start_y[lead]
+        return np.max(a[None, :] - dist, axis=1), np.min(b[None, :] + dist, axis=1)
+
+    # On a replan the first half metre carries on the way the car is already going, so the new route
+    # doesn't kink where it joins the old one. Longer than that and it overshoots when the car was
+    # mid lane change. If the route has to leave the other way it can't fit, and only the start is pinned.
+    ahead = raw[:, 0] - start[0]
+    pinned = np.arange(len(raw)) < 2
+    if start[0] > 0.5:
+        lo2, hi2 = tapered(start[1] + np.clip(np.tan(heading), -slope, slope) * ahead, ahead <= 0.5)
+    if start[0] <= 0.5 or np.any(lo2 > hi2 + 1e-9):
+        lo2, hi2 = tapered(raw[:, 1], pinned)
+    lo, hi = lo2, hi2
+    y = raw[:, 1].copy()
+    if len(y) > 9:
+        for _ in range(12):
+            y = np.clip(np.convolve(np.pad(y, 4, mode="edge"), np.ones(9) / 9, mode="valid"), lo, hi)
+    return np.column_stack([raw[:, 0], y])
 
 
 def make_paths(n):
@@ -315,7 +354,13 @@ def new_sim(choice, paths, obs, v):
 
 
 def replan(sim, obs, v, count=True):
-    route = plan_route(sim["goal"], obs, sim["pos"], v, sim["dev"])
+    # gentle lane changes first; the old 45 degree steps only when nothing gentle fits
+    # the direction the car is actually moving (its body heading lags behind on purpose)
+    (ax, ay), (bx, by) = sim["trail"][-2:] if len(sim["trail"]) > 1 else ((0.0, 0.0), (1.0, 0.0))
+    travel = float(np.arctan2(by - ay, bx - ax))
+    route = plan_route(sim["goal"], obs, sim["pos"], v, sim["dev"], heading=travel)
+    if route is None:
+        route = plan_route(sim["goal"], obs, sim["pos"], v, sim["dev"], steep=True, heading=travel)
     if route is None:
         sim["status"] = "waiting"
         return False
@@ -350,7 +395,9 @@ def step_world(sim, obs, inc):
         cand = r[nidx]
         if not any(overlap(cand[0], cand[1], o, eps=0.1) for o in obs):
             sim["idx"], sim["pos"] = nidx, tuple(cand)
-            sim["heading"] = heading_at(r, nidx)
+            # turn the body toward the route, but no faster than MAX_YAW so a replan never snaps it round
+            turn = np.clip(heading_at(r, nidx) - sim["heading"], -MAX_YAW * DT, MAX_YAW * DT)
+            sim["heading"] = float(sim["heading"] + turn)
             sim["trail"].append(sim["pos"])
         if sim["idx"] >= len(r) - 1:
             sim["running"], sim["status"] = False, "done"
