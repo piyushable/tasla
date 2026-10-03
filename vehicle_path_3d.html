@@ -199,8 +199,11 @@ const HX0 = VEH_LEN / 2, HY0 = HALF_W;
 const HX = HX0 + 0.5, HY = HY0 + 0.6;       // planner collision margins
 const VX = HX0 + 0.3, VY = HY0 + 0.4;       // route-validity margins (looser than planner => no replan thrash)
 const LIM = ROAD_HALF - 0.8;
-const V_NOM = 4.0;                           // autopilot speed in sim-seconds: 40 m = exactly 10 s at 1x
+const V_NOM = 4.3;                           // cruise speed; with the pull-away ramp, 40 m still takes about 10 s at 1x
 const LAT_RATE = 0.95;                       // max lateral speed as a fraction of forward speed
+const ACCEL = 5, BRAKE = 8;                  // pull-away and braking, m/s^2
+const LAT_ACC = 6;                           // how quickly sideways speed can change, m/s^2
+const MAX_YAW = 1.5;                         // fastest the car body turns, rad/s
 
 const OBJ_PROPS = {
   "🧍 Pedestrian": { L: 0.8, W: 0.8, spd: 1.2 },
@@ -505,7 +508,16 @@ function deviationField(nominalPath) {
   return dev;
 }
 
-function planRoute(goal, obs, start, v, nominalPath, tight = false) {
+// seconds to cover d metres starting at v0 and accelerating at ACCEL up to v
+function travelTime(d, v0, v) {
+  if (v0 >= v) return d / v;
+  const ramp = (v * v - v0 * v0) / (2 * ACCEL);
+  return d <= ramp ? (Math.sqrt(v0 * v0 + 2 * ACCEL * d) - v0) / ACCEL : (v - v0) / ACCEL + (d - ramp) / v;
+}
+
+// v0 is the car's speed right now; obstacle predictions use the real arrival time, ramp included.
+// steep allows the old 45 degree sideways steps, for gaps the gentle route can't fit through.
+function planRoute(goal, obs, start, v, nominalPath, tight = false, v0 = v, steep = false) {
   const hxm = tight ? HX0 + .4 : HX, hym = tight ? HY0 + .4 : HY;   // tight mode: smaller safety margins (used with reduced speed)
   const NY = YS.length, [sx, sy] = start;
   const si = Math.round(sx / RES);
@@ -515,7 +527,7 @@ function planRoute(goal, obs, start, v, nominalPath, tight = false) {
   const dev = deviationField(nominalPath);
   const blocked = new Uint8Array(XS.length * NY), vel = Math.max(v, .3);
   for (let i = 0; i < XS.length; i++) {
-    const t = (Math.max(XS[i] - sx, 0) / vel) * 1.1;
+    const t = travelTime(Math.max(XS[i] - sx, 0), Math.min(v0, vel), vel) * 1.1;
     const preds = obs.map(o => ({ o, q: predict(o, t), unc: tight ? .1 : Math.min(.2 + .15 * t * (Math.abs(o.vx) + Math.abs(o.vy)), 1.2) }));
     for (let j = 0; j < NY; j++) {
       const y = YS[j];
@@ -541,19 +553,22 @@ function planRoute(goal, obs, start, v, nominalPath, tight = false) {
   while (heap.size()) {
     const c = heap.pop(), ci = c.i * NY + c.j;
     if (c.g > g[ci] + 1e-5) continue;
-    if (c.i === gi && Math.abs(c.j - gj) <= 1) { endI = c.i; endJ = c.j; break; }
+    if (c.i >= gi && Math.abs(c.j - gj) <= 1) { endI = c.i; endJ = c.j; break; }
     for (let dj = -1; dj <= 1; dj++) {
-      const ni = c.i + 1, nj = c.j + dj;
+      // a sideways step costs two steps forward, capping lane changes at about 27 degrees,
+      // which keeps lane changes gentle enough to look like driving rather than sliding
+      const di = dj && !steep ? 2 : 1, ni = c.i + di, nj = c.j + dj;
       if (ni >= XS.length || nj < 0 || nj >= NY) continue;
       const nIdx = ni * NY + nj;
       if (blocked[nIdx]) continue;
-      const ng = c.g + Math.hypot(1, dj) * RES * (1 + .8 * dev[nIdx]) + .02 * Math.abs(dj);
+      if (di === 2 && (blocked[(c.i + 1) * NY + c.j] || blocked[(c.i + 1) * NY + nj])) continue;
+      const ng = c.g + Math.hypot(di, dj) * RES * (1 + .8 * dev[nIdx]) + .02 * Math.abs(dj);
       if (ng < g[nIdx]) { g[nIdx] = ng; parent[nIdx] = ci; heap.push({ f: ng + RES * (gi - ni) + Math.abs(gj - nj) * RES * .5, g: ng, i: ni, j: nj }); }
     }
   }
   if (endI === -1) return null;
 
-  const raw = [];
+  let raw = [];
   for (let cur = endI * NY + endJ; cur !== -1; cur = parent[cur]) {
     const ci = Math.floor(cur / NY), cj = cur % NY;
     raw.push([XS[ci], YS[cj]]);
@@ -561,20 +576,37 @@ function planRoute(goal, obs, start, v, nominalPath, tight = false) {
   }
   raw.reverse();
   raw[0] = [sx, sy];
-  const k = 7, half = 3;
-  if (raw.length <= k) return densify(raw);
-  const sm = raw.map((_, i) => {
-    let ax = 0, ay = 0;
-    for (let w = -half; w <= half; w++) { const p = raw[clamp(i + w, 0, raw.length - 1)]; ax += p[0]; ay += p[1]; }
-    return [ax / k, ay / k];
+  raw = densify(raw);                             // sideways steps skip a column; refill so points are evenly spaced
+  // Round the grid's kinks with repeated moving averages, clamping each point into the free stretch of
+  // its grid column so smoothing can slide along an obstacle's edge but never cut into it.
+  const n = raw.length, lo = new Float64Array(n), hi = new Float64Array(n);
+  raw.forEach(([x, y], k) => {
+    const ci = clamp(Math.round(x / RES), 0, XS.length - 1), cj = clamp(Math.round((y + ROAD_HALF) / RES), 0, NY - 1);
+    let a = cj, b = cj;
+    if (!blocked[ci * NY + cj]) {
+      while (a > 0 && !blocked[ci * NY + a - 1]) a--;
+      while (b < NY - 1 && !blocked[ci * NY + b + 1]) b++;
+      lo[k] = YS[a]; hi[k] = YS[b];
+    } else lo[k] = hi[k] = y;
   });
-  sm[0] = raw[0]; sm[sm.length - 1] = raw[raw.length - 1];
-  // smoothing must not cut a corner into a blocked cell; otherwise fall back to the raw route
-  const clipped = sm.slice(5).some(p => {
-    const ci = clamp(Math.round(p[0] / RES), 0, XS.length - 1), cj = clamp(Math.round((p[1] + ROAD_HALF) / RES), 0, NY - 1);
-    return blocked[ci * NY + cj];
-  });
-  return densify(clipped ? raw : sm);
+  for (const k of [0, 1, n - 2, n - 1]) if (k >= 0 && k < n) lo[k] = hi[k] = raw[k][1];   // start (car position) and goal stay pinned
+  // An obstacle's edge is a sudden step in these limits, which would put a corner in the smoothed route.
+  // Taper each step into a ramp no steeper than the route itself may be; the raw route still fits inside.
+  const slope = steep ? 1 : .5, tlo = Float64Array.from(lo), thi = Float64Array.from(hi);
+  for (let k = 0; k < n; k++) for (let m = 0; m < n; m++) {
+    const d = Math.abs(raw[m][0] - raw[k][0]) * slope;
+    if (lo[m] - d > tlo[k]) tlo[k] = lo[m] - d;
+    if (hi[m] + d < thi[k]) thi[k] = hi[m] + d;
+  }
+  let y = raw.map(p => p[1]);
+  for (let pass = 0; pass < 12 && n > 9; pass++) {
+    y = y.map((_, i) => {
+      let s = 0;
+      for (let w = -4; w <= 4; w++) s += y[clamp(i + w, 0, n - 1)];
+      return clamp(s / 9, tlo[i], thi[i]);
+    });
+  }
+  return densify(raw.map((p, i) => [p[0], y[i]]));
 }
 
 /* ===== 7. SIM STATE ===== */
@@ -583,7 +615,7 @@ let selectedObstacleType = "🧍 Pedestrian", selectedObstacleMotion = "Static";
 let simSpeedMultiplier = 1.0, driveMode = 'auto';
 
 const sim = {
-  running: false, pos: [0, 0], heading: 0, steerAngle: 0, velocity: 0, route: [], idx: 0, trail: [[0, 0]],
+  running: false, pos: [0, 0], heading: 0, steerAngle: 0, velocity: 0, vy: 0, route: [], idx: 0, trail: [[0, 0]],
   replans: 0, tight: false, status: 'ready', tick: 0, simTime: 0, lastReplanT: 0, collided: false, inContact: false,
 };
 
@@ -741,15 +773,19 @@ function willCollide(x, y, obs, buf = .35) {
   for (const o of obs) if (Math.abs(x - o.x) < o.L / 2 + HX0 + buf && Math.abs(y - o.y) < o.W / 2 + HY0 + buf) return o;
   return null;
 }
+// gap between the car's footprint and an obstacle's box; negative means they overlap
+const clearance = (x, y, o) => Math.max(Math.abs(x - o.x) - (o.L / 2 + HX0), Math.abs(y - o.y) - (o.W / 2 + HY0));
 const curSpeed = () => V_NOM * (sim.tight ? .5 : 1);
 function replan(count = true) {
   const nominal = paths[chosenPathName] || Object.values(paths)[0];
   const start = sim.pos[0] < .5 ? [0, 0] : [sim.pos[0], sim.pos[1]];
   const goal = nominal[nominal.length - 1];
   let r = null;
-  try { r = planRoute(goal, obstacles, start, V_NOM, nominal); sim.tight = false; } catch (e) { console.warn('planRoute failed', e); }
-  if (!r) {                                       // no route with full margins: try tighter margins at half speed
-    try { r = planRoute(goal, obstacles, start, V_NOM * .5, nominal, true); sim.tight = !!r; } catch (e) { console.warn('tight planRoute failed', e); }
+  // gentle lane changes first, the old sharper ones if nothing gentle fits, and only then tighter margins at half speed
+  const attempts = [[V_NOM, false, false], [V_NOM, false, true], [V_NOM * .5, true, false], [V_NOM * .5, true, true]];
+  for (const [v, tight, steep] of attempts) {
+    try { r = planRoute(goal, obstacles, start, v, nominal, tight, sim.velocity, steep); } catch (e) { console.warn('planRoute failed', e); }
+    if (r) { sim.tight = tight; break; }
   }
   sim.lastReplanT = sim.simTime;
   if (!r || r.length < 2) { sim.route = []; sim.status = 'waiting'; sim.tight = false; return false; }
@@ -766,7 +802,7 @@ function routeOk() {
   const r = sim.route;
   if (r.length < 2) return false;
   for (let k = sim.idx + 4; k < Math.min(r.length, sim.idx + 64); k++) {
-    const p = r[k], t = Math.max(p[0] - sim.pos[0], 0) / curSpeed();
+    const p = r[k], t = travelTime(Math.max(p[0] - sim.pos[0], 0), Math.min(sim.velocity, curSpeed()), curSpeed());
     for (const o of obstacles) {
       const q = predict(o, t);
       if (Math.abs(p[0] - q.x) < o.L / 2 + VX && Math.abs(p[1] - q.y) < o.W / 2 + VY) return false;
@@ -775,17 +811,27 @@ function routeOk() {
   return true;
 }
 
+// lateral position of the route at a given x (routes always move forward in x)
+function routeYAt(r, idx, x) {
+  for (let k = Math.max(idx - 1, 0); k < r.length - 1; k++) {
+    const a = r[k], b = r[k + 1];
+    if (x <= b[0]) return b[0] > a[0] ? a[1] + (b[1] - a[1]) * clamp((x - a[0]) / (b[0] - a[0]), 0, 1) : b[1];
+  }
+  return r[r.length - 1][1];
+}
+
 function turnHeading(newHeading, dt, speed) {
-  const dH = newHeading - sim.heading;
-  sim.heading += dH * Math.min(1, dt * 8);
-  const yawRate = dt > 0 ? (dH * Math.min(1, dt * 8)) / dt : 0;
+  // ease toward the direction of travel, but never spin faster than MAX_YAW (at a crawl that direction jumps around)
+  const dH = clamp((newHeading - sim.heading) * Math.min(1, dt * 8), -MAX_YAW * dt, MAX_YAW * dt);
+  sim.heading += dH;
+  const yawRate = dt > 0 ? dH / dt : 0;
   const target = speed > .3 ? clamp(Math.atan(2.6 * yawRate / speed), -.6, .6) : 0;
   sim.steerAngle += (target - sim.steerAngle) * Math.min(1, dt * 10);
 }
 
 function stepAuto(dt) {
   if (sim.status === 'waiting') {
-    sim.velocity = 0;
+    sim.velocity = 0; sim.vy = 0;
     if (sim.simTime - sim.lastReplanT > .3) replan(false);
     if (!sim.waitSince) sim.waitSince = sim.simTime;
     updateStatusDisplay(sim.simTime - sim.waitSince > 3 ? '⏸ Road blocked. Undo or clear an obstacle.' : '⏸ No safe gap. Waiting for clearance...', '#ffaa00');
@@ -796,26 +842,39 @@ function stepAuto(dt) {
   }
   const r = sim.route;
   while (sim.idx < r.length - 2 && r[sim.idx + 1][0] <= sim.pos[0]) sim.idx++;
-  const targetY = r[Math.min(sim.idx + 3, r.length - 1)][1];
-  const [ox, oy] = sim.pos, lim = ROAD_HALF - .9, spd = curSpeed();
-  let advance = 1.0, hit = null, nx, ny;
-  for (const [f, lat] of [[1, 1], [1, 0], [.3, 1], [.3, 0], [0, 0]]) {   // steer+go, straight, steer+creep, straight creep, hold
-    const maxLat = LAT_RATE * spd * dt * f * lat;                      // a stopped car cannot slide sideways
-    ny = clamp(oy + clamp(targetY - oy, -maxLat, maxLat), -lim, lim);
+  const [ox, oy] = sim.pos, lim = ROAD_HALF - .9;
+  // ease toward cruise speed rather than jumping to it; braking is allowed to be quicker
+  const spd = clamp(curSpeed(), sim.velocity - BRAKE * dt, sim.velocity + ACCEL * dt);
+  let advance = 1.0, hit = null, nx, ny, vy = 0;
+  // For each speed (go, creep, hold) try, in order: the smooth move, easing off sideways, then the old exact
+  // route-following and straight-ahead moves. The sharp ones only happen when nothing smoother is collision-free.
+  for (const [f, mode] of [[1, 'smooth'], [1, 'coast'], [1, 'exact'], [1, 'straight'], [.3, 'smooth'], [.3, 'coast'], [.3, 'exact'], [.3, 'straight'], [0, 'hold']]) {
     nx = ox + spd * dt * f;
+    const maxLat = LAT_RATE * spd * f;                                    // a stopped car cannot slide sideways
+    const easeTo = want => clamp(clamp(want, -maxLat, maxLat), sim.vy - LAT_ACC * dt, sim.vy + LAT_ACC * dt);
+    if (mode === 'smooth') {
+      // the route's slope as feed-forward, plus an S-curve correction for any gap
+      const y0 = routeYAt(r, sim.idx, ox), gap = y0 - oy, slope = nx > ox ? (routeYAt(r, sim.idx, nx) - y0) / (nx - ox) : 0;
+      vy = easeTo(slope * spd * f + Math.sign(gap) * Math.min(Math.abs(gap) * 5, Math.sqrt(2 * LAT_ACC * Math.abs(gap))));
+    } else if (mode === 'coast') vy = easeTo(0);
+    else if (mode === 'exact') vy = dt > 0 ? clamp((routeYAt(r, sim.idx, nx) - oy) / dt, -maxLat, maxLat) : 0;
+    else vy = 0;
+    ny = clamp(oy + vy * dt, -lim, lim);
+    // the smooth move may lag the route a little, never by more than the planner's spare margin
+    if ((mode === 'smooth' || mode === 'coast') && Math.abs(ny - routeYAt(r, sim.idx, nx)) > .5) continue;
     hit = willCollide(nx, ny, obstacles, .3);
     advance = f;
     if (!hit) break;
   }
   if (advance === 0) {                           // blocked this tick: brake and ask for a fresh route
-    sim.velocity = 0;
+    sim.velocity = 0; sim.vy = 0;
     updateStatusDisplay(`🛑 BRAKING: ${hit ? hit.type.split(' ')[1] : 'obstacle'} ahead. Re-routing...`, '#ffaa00');
     triggerWarningStrobe();
     if (sim.simTime - sim.lastReplanT > .25) replan(true);
     return;
   }
   sim.pos = [nx, ny];
-  sim.velocity = spd * advance;
+  sim.velocity = spd * advance; sim.vy = vy;
   turnHeading(Math.atan2(ny - oy, nx - ox), dt, sim.velocity);
   if (sim.tick % 4 === 0) sim.trail.push([nx, ny]);
   updateStatusDisplay(sim.tight ? '🐢 Tight gap: squeezing through at half speed' : advance < 1 ? '⚠️ Slowing for obstacle...' : `Driving ${chosenPathName}. A* route active.`, sim.tight || advance < 1 ? '#ffaa00' : '#00f0ff');
@@ -860,8 +919,11 @@ function simStep(dt) {
     let nx = Math.min(o.x + o.vx * dt, X_END + 8), ny = o.y + o.vy * dt, nvy = o.vy;
     if (Math.abs(ny) > LIM) { ny = Math.sign(ny) * (2 * LIM - Math.abs(ny)); nvy = -o.vy; }
     // pedestrians/cows/carts stop rather than walk into a stationary car (potholes never move anyway)
-    const stepsInto = Math.abs(sim.pos[0] - nx) < o.L / 2 + HX0 + .15 && Math.abs(sim.pos[1] - ny) < o.W / 2 + HY0 + .15;
+    // stepping away is always fine, otherwise a walker hemmed in next to the car can never leave
+    const next = { x: nx, y: ny, L: o.L, W: o.W };
+    const stepsInto = clearance(sim.pos[0], sim.pos[1], next) < .15 && clearance(sim.pos[0], sim.pos[1], next) < clearance(sim.pos[0], sim.pos[1], o);
     if (!stepsInto) { o.x = nx; o.y = ny; o.vy = nvy; }
+    else if (sim.velocity < .1 && o.vy) o.vy = -o.vy;   // car is stopped too: turn back instead of both waiting forever
     o.animTime += dt * 4;
   });
   if (driveMode === 'auto') stepAuto(dt); else stepManual(dt);
@@ -926,21 +988,21 @@ function startDriving() {
   if (driveMode === 'auto') {
     if (sim.pos[0] < .5) { sim.pos = [0, 0]; sim.heading = 0; sim.trail = [[0, 0]]; sim.replans = 0; sim.collided = false; sim.inContact = false; }
     replan(false);
-    sim.velocity = sim.status === 'waiting' ? 0 : curSpeed();
+    sim.velocity = 0;                               // pull away smoothly; stepAuto ramps up to cruise speed
     toast(`▶ Driving ${chosenPathName} (goal in ~10 s at 1x)`);
   } else toast('🎮 Manual: W/S throttle & brake, A/D steer');
   setDriveButtons(true);
   lastTime = performance.now();
 }
 function pauseDriving() {
-  sim.running = false; sim.velocity = 0;
+  sim.running = false; sim.velocity = 0; sim.vy = 0;
   setDriveButtons(false); setEngine(-1);
   renderActiveTrajectory();
   updateStatusDisplay("PAUSED // press Start to resume", '#ffaa00');
 }
 function resetSimulation() {
   Object.assign(sim, { running: false, status: 'ready', pos: [0, 0], heading: 0, steerAngle: 0, velocity: 0, idx: 0, route: [], trail: [[0, 0]],
-    replans: 0, tight: false, tick: 0, simTime: 0, lastReplanT: 0, collided: false, inContact: false });
+    replans: 0, tight: false, tick: 0, simTime: 0, lastReplanT: 0, collided: false, inContact: false, vy: 0 });
   obstacles.forEach(o => { o.x = o.x0; o.y = o.y0; o.vy = o.vy0; });
   Object.keys(keys).forEach(k => (keys[k] = false));
   syncObstacleMeshes(); renderActiveTrajectory(); updateTrail(); updatePathUI(); updateTelemetry();
@@ -1092,7 +1154,7 @@ function randomizeObstacles() {
   search: for (let count = 5; count >= 0; count--) for (let attempt = 0; attempt < 15; attempt++) {
     generate(count);
     let ok = count === 0;
-    if (!ok) { try { ok = !!planRoute(nom[nom.length - 1], obstacles, start, V_NOM, nom); } catch (e) { ok = false; } }
+    if (!ok) { try { ok = !!planRoute(nom[nom.length - 1], obstacles, start, V_NOM, nom, false, sim.running ? sim.velocity : 0, true); } catch (e) { ok = false; } }
     if (ok) break search;
   }
   syncObstacleMeshes(); toast(`🎲 Spawned ${obstacles.length} random obstacles`); triggerReplan();
